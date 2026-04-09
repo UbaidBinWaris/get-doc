@@ -1,39 +1,51 @@
-import hashlib
+import argparse
+import csv
+import json
 import logging
-import os
 import re
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Iterable, Optional, Set
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
-from urllib.robotparser import RobotFileParser
 
-import psycopg2
-import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
-EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-PHONE_PATTERN = re.compile(r"\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}")
-DOCTOR_PROFILE_PATH_PATTERN = re.compile(r"^/doctors/[^/]+-\d+$")
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+PHONE_RE = re.compile(r"(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}")
+
+PROFILE_URL_HINTS = ["doctor", "doctors", "provider", "providers", "profile", "agent", "agents", "clinic"]
+
+LINK_PRIORITY_HINTS = [
+    "florida",
+    "doctor",
+    "provider",
+    "agent",
+    "directory",
+    "clinic",
+    "specialist",
+]
 
 
 @dataclass
 class DoctorRecord:
-    source_url: str
-    doctor_name: str
-    clinic_name: Optional[str]
-    phone_number: Optional[str]
+    profile_url: str
+    name: str
+    post: Optional[str]
+    working_place: Optional[str]
     email: Optional[str]
+    phone: Optional[str]
 
 
 def normalize_space(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    cleaned = " ".join(value.split())
-    return cleaned.strip() or None
+    compact = " ".join(value.split())
+    return compact.strip() or None
 
 
 def normalize_phone(value: Optional[str]) -> Optional[str]:
@@ -42,182 +54,215 @@ def normalize_phone(value: Optional[str]) -> Optional[str]:
     digits = re.sub(r"\D", "", value)
     if len(digits) == 11 and digits.startswith("1"):
         digits = digits[1:]
-    return digits or None
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return value.strip()
 
 
-def normalize_email(value: Optional[str]) -> Optional[str]:
-    return value.strip().lower() if value else None
-
-
-def dedupe_hash(doctor_name: str, clinic_name: Optional[str], phone_number: Optional[str], email: Optional[str]) -> str:
-    key = "|".join(
-        [
-            normalize_space(doctor_name or "") or "",
-            normalize_space(clinic_name or "") or "",
-            normalize_phone(phone_number or "") or "",
-            normalize_email(email or "") or "",
-        ]
-    )
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-
-def db_connect():
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = os.getenv("POSTGRES_PORT", "5432")
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-    db = os.getenv("POSTGRES_DB")
-    if not user or not password or not db:
-        raise RuntimeError("POSTGRES_USER, POSTGRES_PASSWORD, and POSTGRES_DB must be set in .env")
-    return psycopg2.connect(host=host, port=port, user=user, password=password, dbname=db)
-
-
-def ensure_schema(conn):
-    sql_file = os.path.join(os.path.dirname(__file__), "sql", "001_create_doctors_table.sql")
-    with open(sql_file, "r", encoding="utf-8") as f:
-        ddl = f.read()
-    with conn.cursor() as cur:
-        cur.execute(ddl)
-    conn.commit()
-
-
-def upsert_doctor(conn, record: DoctorRecord):
-    row_hash = dedupe_hash(record.doctor_name, record.clinic_name, record.phone_number, record.email)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO doctors (
-                source_url,
-                doctor_name,
-                clinic_name,
-                phone_number,
-                email,
-                dedupe_hash,
-                first_seen_at,
-                last_seen_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-            ON CONFLICT (dedupe_hash)
-            DO UPDATE SET
-                source_url = EXCLUDED.source_url,
-                doctor_name = EXCLUDED.doctor_name,
-                clinic_name = COALESCE(EXCLUDED.clinic_name, doctors.clinic_name),
-                phone_number = COALESCE(EXCLUDED.phone_number, doctors.phone_number),
-                email = COALESCE(EXCLUDED.email, doctors.email),
-                last_seen_at = NOW();
-            """,
-            (
-                record.source_url,
-                normalize_space(record.doctor_name),
-                normalize_space(record.clinic_name),
-                normalize_phone(record.phone_number),
-                normalize_email(record.email),
-                row_hash,
-            ),
-        )
-    conn.commit()
-
-
-def build_robots_parser(base_url: str) -> Optional[RobotFileParser]:
-    robots_url = urljoin(base_url, "/robots.txt")
-    parser = RobotFileParser()
-    parser.set_url(robots_url)
-    try:
-        parser.read()
-        return parser
-    except Exception:
-        logging.warning("Could not read robots.txt from %s.", robots_url)
-        return None
-
-
-def can_fetch(parser: Optional[RobotFileParser], user_agent: str, target_url: str) -> bool:
-    if parser is None:
-        return True
-    return parser.can_fetch(user_agent, target_url)
-
-
-def extract_text(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[str]:
+def find_first_text(soup: BeautifulSoup, selectors: Iterable[str]) -> Optional[str]:
     for selector in selectors:
         node = soup.select_one(selector)
-        if node:
-            txt = normalize_space(node.get_text(" ", strip=True))
-            if txt:
-                return txt
+        if not node:
+            continue
+        text = normalize_space(node.get_text(" ", strip=True))
+        if text:
+            return text
     return None
 
 
-def extract_email(soup: BeautifulSoup) -> Optional[str]:
-    mailto = soup.select_one('a[href^="mailto:"]')
-    if mailto and mailto.get("href"):
-        return normalize_email(mailto["href"].replace("mailto:", "").strip())
-    m = EMAIL_PATTERN.search(soup.get_text(" ", strip=True))
-    return normalize_email(m.group(0)) if m else None
+def detect_cloudflare_challenge(html: str) -> bool:
+    low = html.lower()
+    return "just a moment" in low and "cf_chl" in low
 
 
-def extract_phone(soup: BeautifulSoup) -> Optional[str]:
-    tel = soup.select_one('a[href^="tel:"]')
-    if tel and tel.get("href"):
-        return normalize_phone(tel["href"].replace("tel:", "").strip())
-    m = PHONE_PATTERN.search(soup.get_text(" ", strip=True))
-    return normalize_phone(m.group(0)) if m else None
+def wait_for_cloudflare_clear(page, timeout_seconds: int, check_interval_seconds: float = 2.0) -> bool:
+    end_at = time.time() + max(1, timeout_seconds)
+    while time.time() < end_at:
+        try:
+            html = page.content()
+        except Exception:
+            time.sleep(check_interval_seconds)
+            continue
+
+        if not detect_cloudflare_challenge(html):
+            return True
+
+        time.sleep(check_interval_seconds)
+
+    return False
 
 
-def parse_doctor_page(url: str, html: str) -> Optional[DoctorRecord]:
+def extract_emails(soup: BeautifulSoup, text: str) -> List[str]:
+    found: Set[str] = set()
+    for a in soup.select('a[href^="mailto:"]'):
+        href = (a.get("href") or "").replace("mailto:", "").strip()
+        for part in href.split("?"):
+            if EMAIL_RE.fullmatch(part.strip()):
+                found.add(part.strip().lower())
+    for m in EMAIL_RE.findall(text):
+        found.add(m.lower())
+    return sorted(found)
+
+
+def extract_phones(soup: BeautifulSoup, text: str) -> List[str]:
+    found: Set[str] = set()
+    for a in soup.select('a[href^="tel:"]'):
+        href = (a.get("href") or "").replace("tel:", "").strip()
+        if href:
+            found.add(normalize_phone(href) or href)
+    for m in PHONE_RE.findall(text):
+        normalized = normalize_phone(m)
+        if normalized:
+            found.add(normalized)
+    return sorted(found)
+
+
+def parse_labeled_value(soup: BeautifulSoup, labels: Iterable[str]) -> Optional[str]:
+    label_set = {x.lower() for x in labels}
+    for node in soup.find_all(string=True):
+        current = normalize_space(str(node))
+        if not current:
+            continue
+        low = current.lower().strip(":")
+        if low not in label_set:
+            continue
+
+        parent = node.parent
+        if parent and parent.next_sibling:
+            value = normalize_space(getattr(parent.next_sibling, "get_text", lambda *args, **kwargs: str(parent.next_sibling))(" ", strip=True))
+            if value and value.lower() not in label_set:
+                return value
+
+        if parent:
+            next_el = parent.find_next()
+            if next_el:
+                value = normalize_space(next_el.get_text(" ", strip=True))
+                if value and value.lower() not in label_set:
+                    return value
+    return None
+
+
+def is_florida_url(url: str) -> bool:
+    """Return True if the URL is a Florida-specific directory page."""
+    path = urlparse(url).path.lower()
+    return (
+        "florida" in path
+        or "-fl-" in path
+        or path.endswith("-fl")
+        or "/fl/" in path
+        or path.startswith("/fl-")
+    )
+
+
+def should_queue_url(url: str) -> bool:
+    """Queue agent/agency profiles unconditionally; all other pages only if Florida-related."""
+    path = urlparse(url).path.lower()
+    if "/agents/" in path or "/agencies/" in path:
+        return True
+    return is_florida_url(url) or "medicare-agents-near-me" in path
+
+
+def looks_like_florida(url: str, text: str) -> bool:
+    url_l = url.lower()
+    text_l = f" {text.lower()} "
+    # URL-based: require proper FL state/city slug, not just any "-fl" suffix
+    if "florida" in url_l or "-fl-" in url_l or "/fl/" in url_l or url_l.endswith("-fl"):
+        return True
+    # Text-based: full word "florida" only — weak hints like ", fl" cause false positives
+    # from navigation menus that appear on every page of the site
+    return " florida " in text_l or " florida," in text_l or " florida." in text_l
+
+
+def looks_like_profile_page(url: str, soup: BeautifulSoup, text: str) -> bool:
+    path = urlparse(url).path.lower()
+    if any(hint in path for hint in PROFILE_URL_HINTS):
+        return True
+    h1 = find_first_text(soup, ["h1"])
+    has_contact = bool(EMAIL_RE.search(text) or PHONE_RE.search(text))
+    if h1 and has_contact:
+        return True
+    return False
+
+
+def extract_record_from_page(url: str, html: str, is_florida_context: bool = False) -> Optional[DoctorRecord]:
     soup = BeautifulSoup(html, "html.parser")
+    text = normalize_space(soup.get_text(" ", strip=True)) or ""
 
-    name = extract_text(
+    if not looks_like_profile_page(url, soup, text):
+        return None
+    # Accept if provenance shows it was linked from a Florida page, OR text confirms Florida
+    if not is_florida_context and not looks_like_florida(url, text):
+        return None
+
+    name = find_first_text(
         soup,
         [
             "h1",
-            "[data-testid*='doctor-name']",
+            "[itemprop='name']",
+            ".doctor-name",
+            ".provider-name",
             "meta[property='og:title']",
             "title",
         ],
     )
+    if name and "|" in name:
+        name = normalize_space(name.split("|")[0])
 
-    # Many provider pages store clinic/practice in labeled sections or address containers.
-    clinic = extract_text(
+    post = find_first_text(
         soup,
         [
-            "[data-testid*='practice']",
-            "[data-testid*='location']",
-            "address",
-            ".practice-name",
-            ".office-name",
+            ".title",
+            ".designation",
+            ".position",
+            "[itemprop='jobTitle']",
+            ".provider-title",
         ],
     )
 
-    email = extract_email(soup)
-    phone = extract_phone(soup)
+    working_place = find_first_text(
+        soup,
+        [
+            ".clinic-name",
+            ".practice-name",
+            ".company-name",
+            ".hospital-name",
+            "[itemprop='worksFor']",
+        ],
+    )
+    if not working_place:
+        working_place = parse_labeled_value(
+            soup,
+            ["clinic", "practice", "hospital", "office", "workplace", "organization", "company"],
+        )
+
+    emails = extract_emails(soup, text)
+    phones = extract_phones(soup, text)
 
     if not name:
         return None
 
     return DoctorRecord(
-        source_url=url,
-        doctor_name=name,
-        clinic_name=clinic,
-        phone_number=phone,
-        email=email,
+        profile_url=url,
+        name=name,
+        post=post,
+        working_place=working_place,
+        email=emails[0] if emails else None,
+        phone=phones[0] if phones else None,
     )
 
 
-def is_allowed_domain(target: str, allowed_netlocs: Set[str]) -> bool:
-    return urlparse(target).netloc.lower() in allowed_netlocs
+def same_domain(target_url: str, allowed_domains: Set[str]) -> bool:
+    host = urlparse(target_url).netloc.lower()
+    return host in allowed_domains
 
 
-def looks_like_doctor_profile(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    if "/doctor/" in path:
-        return True
-    return DOCTOR_PROFILE_PATH_PATTERN.match(path) is not None
-
-
-def extract_candidate_links(current_url: str, html: str) -> Set[str]:
+def extract_links(current_url: str, html: str, allowed_domains: Set[str]) -> Tuple[List[str], List[str]]:
     soup = BeautifulSoup(html, "html.parser")
-    links: Set[str] = set()
+    priority: Set[str] = set()
+    normal: Set[str] = set()
+
     for a in soup.select("a[href]"):
-        href = a.get("href")
+        href = (a.get("href") or "").strip()
         if not href:
             continue
         absolute = urljoin(current_url, href)
@@ -225,153 +270,246 @@ def extract_candidate_links(current_url: str, html: str) -> Set[str]:
         if parsed.scheme not in {"http", "https"}:
             continue
         clean = absolute.split("#")[0]
-        links.add(clean)
-    return links
-
-
-def fetch_page(session: requests.Session, url: str, timeout: int) -> Optional[str]:
-    max_retries = int(os.getenv("MAX_RETRIES", "2"))
-    retry_backoff_seconds = float(os.getenv("RETRY_BACKOFF_SECONDS", "2"))
-
-    total_attempts = max_retries + 1
-    for attempt in range(1, total_attempts + 1):
-        try:
-            resp = session.get(url, timeout=timeout)
-            if resp.status_code != 200:
-                logging.warning(
-                    "Non-200 response %s for %s (attempt %d/%d)",
-                    resp.status_code,
-                    url,
-                    attempt,
-                    total_attempts,
-                )
-                return None
-            return resp.text
-        except requests.RequestException as exc:
-            logging.warning(
-                "Request failed for %s (attempt %d/%d): %s",
-                url,
-                attempt,
-                total_attempts,
-                exc,
-            )
-            if attempt < total_attempts:
-                time.sleep(retry_backoff_seconds * attempt)
-    return None
-
-
-def push_links(queue: deque, visited: Set[str], allowed_netlocs: Set[str], current_url: str, html: str) -> tuple[int, int]:
-    links = extract_candidate_links(current_url, html)
-    added = 0
-    for link in links:
-        if is_allowed_domain(link, allowed_netlocs) and link not in visited:
-            queue.append(link)
-            added += 1
-    return added, len(links)
-
-
-def save_doctor_if_profile(conn, url: str, html: str) -> bool:
-    if not looks_like_doctor_profile(url):
-        return False
-
-    record = parse_doctor_page(url, html)
-    if not record:
-        return False
-
-    upsert_doctor(conn, record)
-    logging.info(
-        "Saved: %s | clinic=%s | phone=%s | email=%s",
-        record.doctor_name,
-        record.clinic_name,
-        record.phone_number,
-        record.email,
-    )
-    return True
-
-
-def crawl_and_scrape():
-    load_dotenv()
-
-    start_url = os.getenv("START_URL", "https://health.usnews.com/doctors")
-    user_agent = os.getenv("USER_AGENT", "DoctorDataBot/1.0 (+contact@example.com)")
-    request_delay = float(os.getenv("REQUEST_DELAY_SECONDS", "1.5"))
-    max_pages = int(os.getenv("MAX_PAGES", "500"))
-    max_doctors = int(os.getenv("MAX_DOCTORS", "10000"))
-    timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
-    allowed_netlocs = {
-        n.strip().lower() for n in os.getenv("ALLOWED_NETLOCS", "health.usnews.com").split(",") if n.strip()
-    }
-
-    logging.info("Start URL: %s", start_url)
-    logging.info("Max pages: %d, max doctors: %d", max_pages, max_doctors)
-    logging.info("Allowed netlocs: %s", sorted(allowed_netlocs))
-
-    base_url = f"{urlparse(start_url).scheme}://{urlparse(start_url).netloc}"
-    robots_parser = build_robots_parser(base_url)
-
-    if not can_fetch(robots_parser, user_agent, start_url):
-        raise RuntimeError("robots.txt blocks this crawler for the configured USER_AGENT.")
-
-    headers = {"User-Agent": user_agent}
-    session = requests.Session()
-    session.headers.update(headers)
-
-    conn = db_connect()
-    ensure_schema(conn)
-
-    queue = deque([start_url])
-    visited: Set[str] = set()
-    scraped_count = 0
-    page_count = 0
-    fetch_failures = 0
-
-    while queue and page_count < max_pages and scraped_count < max_doctors:
-        url = queue.popleft()
-        if url in visited:
-            continue
-        visited.add(url)
-
-        if not is_allowed_domain(url, allowed_netlocs):
+        if not same_domain(clean, allowed_domains):
             continue
 
-        if not can_fetch(robots_parser, user_agent, url):
-            logging.debug("Blocked by robots.txt: %s", url)
-            continue
+        low = clean.lower()
+        if any(h in low for h in LINK_PRIORITY_HINTS):
+            priority.add(clean)
+        else:
+            normal.add(clean)
 
-        html = fetch_page(session, url, timeout)
-        page_count += 1
-        if not html:
-            fetch_failures += 1
-            logging.warning("Skipping %s because HTML could not be fetched.", url)
-            continue
+    return sorted(priority), sorted(normal)
 
-        added, discovered = push_links(queue, visited, allowed_netlocs, url, html)
-        logging.info(
-            "Page %d: discovered %d links, queued %d links from %s",
-            page_count,
-            discovered,
-            added,
-            url,
+
+def save_records_csv(path: Path, records: List[DoctorRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["name", "post", "working_place", "email", "phone", "profile_url"],
         )
+        writer.writeheader()
+        for rec in records:
+            writer.writerow(asdict(rec))
 
-        if save_doctor_if_profile(conn, url, html):
-            scraped_count += 1
-            logging.info("Saved doctor count: %d", scraped_count)
 
-        time.sleep(request_delay)
+def save_records_json(path: Path, records: List[DoctorRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [asdict(r) for r in records]
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    conn.close()
-    logging.info(
-        "Done. Pages visited: %d, fetch failures: %d, doctors saved/updated: %d",
-        page_count,
-        fetch_failures,
-        scraped_count,
+
+def run_scraper(
+    base_url: str,
+    output_csv: Path,
+    output_json: Path,
+    max_pages: int,
+    max_records: int,
+    delay_seconds: float,
+    headless: bool,
+    start_paths: List[str],
+    challenge_wait_seconds: int,
+    user_data_dir: Path,
+) -> None:
+    parsed_base = urlparse(base_url)
+    allowed_domains = {parsed_base.netloc.lower()}
+    if parsed_base.netloc.startswith("www."):
+        allowed_domains.add(parsed_base.netloc.replace("www.", "", 1))
+    else:
+        allowed_domains.add("www." + parsed_base.netloc)
+
+    queue = deque(urljoin(base_url, p) for p in start_paths)
+    visited: Set[str] = set()
+    records_by_key: Dict[str, DoctorRecord] = {}
+    # Track agent URLs discovered on Florida directory pages for provenance-based filtering
+    florida_agent_urls: Set[str] = set()
+
+    with sync_playwright() as pw:
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = context.new_page()
+        if not headless:
+            page.bring_to_front()
+
+        while queue and len(visited) < max_pages and len(records_by_key) < max_records:
+            url = queue.popleft()
+            if url in visited:
+                continue
+            visited.add(url)
+
+            logging.info("Visiting %s", url)
+            try:
+                page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            except PlaywrightTimeoutError:
+                logging.warning("Timeout while loading %s", url)
+                continue
+            except Exception as exc:
+                if "interrupted by another navigation" in str(exc):
+                    # Site did a JS redirect mid-load — wait for the new page to settle
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                    except Exception:
+                        logging.warning("Could not settle after redirect from %s", url)
+                        continue
+                else:
+                    logging.warning("Failed to load %s: %s", url, exc)
+                    continue
+
+            try:
+                page.wait_for_timeout(int(delay_seconds * 1000))
+                html = page.content()
+                final_url = page.url
+            except Exception as exc:
+                logging.warning("Could not get content from %s: %s", url, exc)
+                continue
+
+            # Mark redirect destination as visited so we don't re-crawl it separately
+            if final_url != url and final_url not in visited:
+                visited.add(final_url)
+
+            if detect_cloudflare_challenge(html):
+                logging.warning(
+                    "Cloudflare challenge detected. Solve it in the opened browser window. "
+                    "Waiting up to %s seconds for it to clear...",
+                    challenge_wait_seconds,
+                )
+
+                cleared = wait_for_cloudflare_clear(page, timeout_seconds=challenge_wait_seconds)
+                if not cleared:
+                    logging.warning(
+                        "Challenge did not clear for %s within timeout. Skipping this page.",
+                        url,
+                    )
+                    continue
+
+                try:
+                    page.wait_for_timeout(int(delay_seconds * 1000))
+                    html = page.content()
+                    final_url = page.url
+                except Exception as exc:
+                    logging.warning("Could not continue after challenge on %s: %s", url, exc)
+                    continue
+
+            # Tag agent URLs discovered on Florida directory pages for provenance tracking
+            page_is_florida = is_florida_url(final_url) or is_florida_url(url)
+            priority_links, normal_links = extract_links(final_url, html, allowed_domains)
+            if page_is_florida:
+                for lnk in priority_links + normal_links:
+                    if "/agents/" in urlparse(lnk).path.lower():
+                        florida_agent_urls.add(lnk.lower())
+
+            agent_is_florida = (
+                url.lower() in florida_agent_urls
+                or final_url.lower() in florida_agent_urls
+                or page_is_florida
+            )
+            record = extract_record_from_page(final_url, html, is_florida_context=agent_is_florida)
+            if record:
+                key = "|".join(
+                    [
+                        normalize_space(record.name or "") or "",
+                        normalize_space(record.email or "") or "",
+                        normalize_space(record.phone or "") or "",
+                        normalize_space(record.working_place or "") or "",
+                    ]
+                )
+                if key not in records_by_key:
+                    records_by_key[key] = record
+                    logging.info(
+                        "Saved record #%d: %s | %s | %s",
+                        len(records_by_key),
+                        record.name,
+                        record.email or "no-email",
+                        record.phone or "no-phone",
+                    )
+
+            for nxt in priority_links + normal_links:
+                if nxt not in visited and should_queue_url(nxt):
+                    queue.append(nxt)
+
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+
+        context.close()
+
+    records = sorted(records_by_key.values(), key=lambda r: (r.name.lower(), r.profile_url.lower()))
+    save_records_csv(output_csv, records)
+    save_records_json(output_json, records)
+
+    logging.info("Done. Pages visited: %d", len(visited))
+    logging.info("Florida doctor records saved: %d", len(records))
+    logging.info("CSV: %s", output_csv)
+    logging.info("JSON: %s", output_json)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scrape Florida doctors from medicareagentshub.com and export name/post/workplace/email/phone."
+    )
+    parser.add_argument("--base-url", default="https://medicareagentshub.com")
+    parser.add_argument("--output-csv", default="data/florida_doctors.csv")
+    parser.add_argument("--output-json", default="data/florida_doctors.json")
+    parser.add_argument("--max-pages", type=int, default=1500)
+    parser.add_argument("--max-records", type=int, default=50000)
+    parser.add_argument("--delay-seconds", type=float, default=1.0)
+    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode.")
+    parser.add_argument(
+        "--challenge-wait-seconds",
+        type=int,
+        default=600,
+        help="How long to wait for Cloudflare challenge to clear in browser before skipping page.",
+    )
+    parser.add_argument(
+        "--user-data-dir",
+        default=".pw-user-data",
+        help="Persistent browser profile directory to reuse cookies/session between runs.",
+    )
+    parser.add_argument(
+        "--start-paths",
+        nargs="+",
+        default=[
+            "/medicare-agents-near-me/florida",
+            "/miami-fl-medicare-agents",
+            "/tampa-fl-medicare-agents",
+            "/orlando-fl-medicare-agents",
+            "/jacksonville-fl-medicare-agents",
+            "/fort-lauderdale-fl-medicare-agents",
+            "/st-petersburg-fl-medicare-agents",
+            "/hialeah-fl-medicare-agents",
+            "/cape-coral-fl-medicare-agents",
+            "/tallahassee-fl-medicare-agents",
+        ],
+        help="Initial paths to seed the crawler queue.",
+    )
+    parser.add_argument("--log-level", default="INFO")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    run_scraper(
+        base_url=args.base_url,
+        output_csv=Path(args.output_csv),
+        output_json=Path(args.output_json),
+        max_pages=args.max_pages,
+        max_records=args.max_records,
+        delay_seconds=args.delay_seconds,
+        headless=args.headless,
+        start_paths=args.start_paths,
+        challenge_wait_seconds=args.challenge_wait_seconds,
+        user_data_dir=Path(args.user_data_dir),
     )
 
 
 if __name__ == "__main__":
-    load_dotenv()
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
-    crawl_and_scrape()
+    main()

@@ -1,3 +1,25 @@
 .env
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Playwright browser binaries & profile
+.pw-user-data/
+
+# Output data
+data/*.csv
+data/*.json
+
+# Pip / requirements lock artefacts
+pip-log.txt
+pip-delete-this-directory.txt
+*.egg-info/
+dist/
+build/
